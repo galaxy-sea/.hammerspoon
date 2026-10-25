@@ -172,7 +172,7 @@ local function htmlShell(content)
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
 * { box-sizing: border-box; }
-html, body { margin:0; height:100%; width:100%; background:transparent; }
+html, body { margin:0; height:100%; width:100%; background:transparent; overflow:hidden; }
 body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; color:#edf2f5; }
 .panel {
   margin:6px; height:calc(100% - 12px); padding:26px 25px 21px;
@@ -193,7 +193,7 @@ button { font:inherit; cursor:pointer; border:0; border-radius:11px; min-height:
 .footer { color:#98acb7; font-size:11px; margin-top:15px; }
 .search-hint { margin-top:16px; font-size:15px; font-weight:600; color:#c8e1d5; }
 .floating {
-  width:calc(100% - 4px); height:calc(100% - 4px); margin:2px;
+  width:calc(100% - 4px); height:calc(100% - 4px); min-height:0; margin:2px;
   border-radius:8px; border:1px solid transparent;
   box-shadow:0 3px 9px rgba(0,0,0,.27);
   cursor:default; font-size:12px; font-weight:700;
