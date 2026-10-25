@@ -10,3 +10,4 @@ Hammerspoon 脚本集合，功能及快捷键由 `init.lua` 统一配置。
 | [lockscreen_camera.lua](modules/lockscreen_camera.lua) | 锁屏唤醒拍照、解锁时补拍及解锁后定时拍摄，分阶段发送邮件，成功后清理照片及日期目录；连接指定 Wi-Fi 时跳过。 | 监听：锁屏、解锁、显示器休眠与唤醒、系统休眠与关机、用户会话离开及 Wi-Fi 变化；无快捷键。 |
 | [close_last_window_hide.lua](modules/close_last_window_hide.lua) | 关闭应用最后一个窗口后自动隐藏应用，不拦截原有关闭操作。 | 监听：`Cmd + W`。 |
 | [blink_reminder.lua](modules/blink_reminder.lua) | 每 20 分钟提醒休息，支持延后及悬停确认关闭。 | 测试快捷键：`Ctrl + Option + Cmd + B`，默认不绑定。 |
+| [android_moorage.lua](modules/android_moorage.lua) | 有可用 Android 设备时启动 Moorage，无可用设备时退出；重新启动前等待退出完成。 | 监听：USB 插拔及 Moorage 退出；每次插拔查询一次 ADB，无快捷键。 |

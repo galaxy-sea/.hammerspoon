@@ -35,4 +35,11 @@ require("modules.blink_reminder").start({
     bind = false,
 })
 
+-- USB 插拔时查询 ADB：有可用 Android 设备则启动 Moorage，否则请求正常退出。
+require("modules.android_moorage").start({
+    adb = "/opt/homebrew/bin/adb",
+    appBundleID = "com.skylerschoos.moorage",
+    disconnectDelay = 1, -- 确认无可用设备后等待 1 秒，再请求正常退出一次。
+})
+
 hs.alert.show("Hammerspoon 配置已加载")
