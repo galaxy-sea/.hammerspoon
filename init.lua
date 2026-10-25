@@ -10,7 +10,16 @@ require("modules.window_resize").start({
     key = "5",
 })
 
-require("modules.lockscreen_camera").start()
+-- 明确使用 msmtp 的 qq 账户：2468080401@qq.com 发给 469753862@qq.com。
+require("modules.lockscreen_camera").start({
+    account = "qq",
+    from = "2468080401@qq.com",
+    fromName = "MacBook Pro 21 M1 Pro",
+    to = { "469753862@qq.com" },
+    lockedInterval = 5,        -- 锁屏唤醒后拍摄间隔（秒）
+    afterUnlockCount = 10,     -- 解锁后拍摄数量（张）
+    afterUnlockInterval = 30,  -- 解锁后首张等待时间及后续拍摄间隔（秒）
+})
 
 -- 监听应用的关闭窗口快捷键，不拦截原始按键。
 require("modules.close_last_window_hide").start({

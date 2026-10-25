@@ -1,5 +1,6 @@
 .DS_Store
 .idea/
+.lockscreen_camera/
 
 # Compiled class file
 *.class

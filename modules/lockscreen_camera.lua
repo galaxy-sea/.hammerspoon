@@ -1,0 +1,533 @@
+-- 单张 ImageSnap + 单调时钟；邮件与摄像头各自独立，所有报告先落盘再发送。
+local M = {}
+local home = os.getenv("HOME")
+local defaults = {
+    imagesnap = "/opt/homebrew/bin/imagesnap",
+    msmtp = "/opt/homebrew/bin/msmtp",
+    account = "default",
+    from = "", -- 在 init.lua 设置；不在这里保存 SMTP 密码。
+    fromName = "", -- 收件人看到的发件人显示名；不用于 SMTP 登录或信封地址。
+    to = {},
+    photoRoot = home .. "/Downloads/异常解锁",
+    stateRoot = hs.configdir .. "/.lockscreen_camera",
+    lockedInterval = 5,
+    afterUnlockInterval = 30,
+    afterUnlockCount = 10,
+    warmup = 0.5,
+    cameraTimeout = 15,
+    mailTimeout = 90,
+    maxLockedSeconds = 0, -- 0：亮屏期间一直拍到解锁；黑屏始终结束本轮。
+    maxMailBytes = 10 * 1024 * 1024, -- 包括 Base64 和 MIME 开销。
+    retryInitial = 30,
+    retryMax = 3600,
+    device = nil, -- nil：系统默认摄像头；否则传给 imagesnap -d。
+}
+local cfg, watcher, previousShutdown, shutdownHook
+local running, locked, awake, wakeHandled, followupArmed = false, false, false, false, false
+local followupDir -- 同一轮锁屏与解锁后拍摄共用目录，报告和邮件仍各自独立。
+local followupThreadRoot -- 两个阶段及分封邮件均引用本轮第一封邮件。
+local session, camera, mailTask, mailTimer, mailTimeout, stateLock
+local reports = {}
+local log = hs.logger.new("lockscreen_camera", "info")
+local finish, capture, pumpMail
+
+local function monotonic() return hs.timer.absoluteTime() / 1e9 end
+local function wall() return hs.timer.secondsSinceEpoch() end
+local function stamp() return os.date("%Y-%m-%d_%H-%M-%S") end
+local function stopTimer(t) if t then t:stop() end end
+local function uuid() return (hs.host.uuid():gsub("[^%w]", "")) end
+local function short(s) return tostring(s or ""):sub(1, 3000) end
+
+local function note(level, message)
+    log[level](message)
+    if cfg then
+        local f = io.open(cfg.stateRoot .. "/camera.log", "a")
+        if f then f:write(os.date("%Y-%m-%d %H:%M:%S "), level, " ", message, "\n"); f:close() end
+    end
+end
+
+local function mkdir(path)
+    if hs.fs.attributes(path, "mode") == "directory" then return end
+    local parent = path:match("^(.*)/[^/]+$")
+    if parent and parent ~= "" then mkdir(parent) end
+    assert(hs.fs.mkdir(path))
+end
+
+local function save(r)
+    local path = cfg.stateRoot .. "/reports/" .. r.id .. ".json"
+    local f = assert(io.open(path .. ".tmp", "wb"))
+    local ok, err = f:write(hs.json.encode(r, true))
+    local closed, closeError = f:close()
+    assert(ok, err); assert(closed, closeError)
+    assert(os.rename(path .. ".tmp", path))
+end
+
+local function readJSON(path)
+    local f = assert(io.open(path, "rb"))
+    local data = f:read("a"); f:close()
+    return assert(hs.json.decode(data), "无效 JSON：" .. path)
+end
+
+-- 禁用退出回调后强制结束并回收，下一任务绝不与上一摄像头重叠。
+local function killTask(task)
+    if not task then return end
+    task:setCallback(nil)
+    if task:isRunning() then
+        local pid = assert(tonumber(task:pid()))
+        hs.execute("/bin/kill -KILL " .. string.format("%d", pid))
+        task:waitUntilExit()
+    end
+end
+
+local function validJPEG(path)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local size = f:seek("end")
+    local valid = false
+    if size and size >= 4 then
+        f:seek("set", 0); local first = f:read(2)
+        f:seek("end", -2); local last = f:read(2)
+        valid = first == "\255\216" and last == "\255\217"
+    end
+    f:close()
+    return valid, size
+end
+
+local function acceptPending(r)
+    local p = r.pending
+    if not p then return false end
+    local valid, size = validJPEG(p.final)
+    if not valid then
+        valid, size = validJPEG(p.path)
+        if valid then assert(os.rename(p.path, p.final)) end
+    end
+    if valid then
+        r.photos[#r.photos + 1] = { path = p.final, size = size, started = p.started,
+            completed = wall(), monotonicStart = p.monotonicStart, monotonicEnd = monotonic() }
+    else
+        os.remove(p.path)
+    end
+    r.pending = nil
+    return valid
+end
+
+-- MIME 预算预留正文/头部及每个附件开销；超大单图按原始字节拆分，绝不丢弃。
+local function plan(r)
+    local budget = math.floor((cfg.maxMailBytes - 65536) / 1.38)
+    local parts, group, used = {}, {}, 0
+    for _, photo in ipairs(r.photos) do
+        local offset, piece = 0, 0
+        while offset < photo.size do
+            if budget - used <= 2048 then
+                parts[#parts + 1] = group; group, used = {}, 0
+            end
+            local length = math.min(photo.size - offset, budget - used - 2048)
+            local name = photo.path:match("([^/]+)$")
+            if photo.size + 2048 > budget then
+                -- 每个超大图片块单独一封，块号和偏移固定，可按序拼回原图。
+                if #group > 0 then parts[#parts + 1] = group; group, used = {}, 0 end
+                length = math.min(photo.size - offset, budget - 2048)
+                piece = piece + 1
+                name = name .. string.format(".part%06d", piece)
+            elseif length < photo.size then
+                parts[#parts + 1] = group; group, used = {}, 0
+                length = photo.size
+            end
+            group[#group + 1] = { path = photo.path, name = name, offset = offset, length = length }
+            used = used + length + 2048
+            offset = offset + length
+        end
+    end
+    if #group > 0 or #parts == 0 then parts[#parts + 1] = group end
+    r.parts, r.nextPart, r.attempts, r.retryAt = parts, 1, 0, 0
+end
+
+local function safe(fn)
+    return function(...)
+        local ok, err = xpcall(fn, debug.traceback, ...)
+        if not ok then
+            note("e", short(err))
+            if session then
+                local ended, why = pcall(finish, "内部错误：" .. short(err))
+                if not ended then note("e", "结束本轮失败，保留日志恢复：" .. short(why)) end
+            end
+            if running and not mailTask then
+                stopTimer(mailTimer)
+                mailTimer = hs.timer.doAfter(cfg.retryInitial, safe(pumpMail))
+            end
+        end
+    end
+end
+
+local function encoded(s)
+    -- 避免 hs.base64.encode(data, 76) 对大字符串反复拼接。
+    local b = hs.base64.encode(s)
+    return (b:gsub("............................................................" ..
+        "................", "%0\r\n")) .. "\r\n"
+end
+
+local function header(s)
+    -- RFC 2047，每行不超过 75 字符，按 UTF-8 字符边界切块。
+    local words, chunk = {}, ""
+    for _, code in utf8.codes(s) do
+        local c = utf8.char(code)
+        if #chunk + #c > 42 then words[#words + 1] = "=?UTF-8?B?" .. hs.base64.encode(chunk) .. "?="; chunk = "" end
+        chunk = chunk .. c
+    end
+    if #chunk > 0 then words[#words + 1] = "=?UTF-8?B?" .. hs.base64.encode(chunk) .. "?=" end
+    return table.concat(words, "\r\n ")
+end
+
+local function percent(s)
+    return (s:gsub("([^%w%.%-_])", function(c) return string.format("%%%02X", c:byte()) end))
+end
+
+local function message(r)
+    local part = r.nextPart
+    local boundary = "lockscreen_" .. r.id .. "_" .. part
+    local kind = r.kind == "locked" and "锁屏期间照片" or "解锁后照片"
+    local subject = cfg.fromName .. " - 锁屏异常唤醒"
+    local body = string.format("设备：%s\n阶段：%s\n开始：%s\n结束：%s\n原因：%s\n照片总数：%d\n本机目录：%s\n邮件：%d/%d\n",
+        cfg.deviceName, kind, r.startedText, r.endedText, short(r.reason), #r.photos, r.dir, part, #r.parts)
+        .. "超限时分封保留全部照片。*.jpg.partNNNNNN 为原图字节块，请收齐同名块后按块号拼接（cat 原文件名.jpg.part* > restored.jpg）。\n"
+        .. "原图和发送记录均保存在本机；SMTP 超时重试可能产生相同 Message-ID 的重复邮件。\n"
+    local sender = cfg.from
+    if cfg.fromName ~= "" then sender = header(cfg.fromName) .. " <" .. cfg.from .. ">" end
+    local messageID = string.format("<%s.%d@lockscreen-camera.local>", r.id, part)
+    -- 兼容旧队列；重试保持原 Message-ID，新邮件则通过引用归入同一会话。
+    local threadRoot = r.threadRoot or string.format("<%s.1@lockscreen-camera.local>", r.id)
+    local out = {
+        "From: " .. sender, "To: " .. table.concat(cfg.to, ", "),
+        "Subject: " .. header(subject),
+        "Date: " .. os.date("!%a, %d %b %Y %H:%M:%S +0000"),
+        "Message-ID: " .. messageID,
+    }
+    if messageID ~= threadRoot then
+        out[#out + 1] = "In-Reply-To: " .. threadRoot
+        out[#out + 1] = "References: " .. threadRoot
+    end
+    local content = {
+        "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="' .. boundary .. '"', "",
+        "--" .. boundary, "Content-Type: text/plain; charset=UTF-8", "Content-Transfer-Encoding: base64", "", encoded(body),
+    }
+    for _, line in ipairs(content) do out[#out + 1] = line end
+    for _, attachment in ipairs(r.parts[part]) do
+        local f = assert(io.open(attachment.path, "rb"))
+        assert(f:seek("set", attachment.offset))
+        local data = f:read(attachment.length); f:close()
+        assert(data and #data == attachment.length, "附件缺失或长度变化：" .. attachment.path)
+        out[#out + 1] = "--" .. boundary
+        out[#out + 1] = "Content-Type: application/octet-stream"
+        out[#out + 1] = "Content-Disposition: attachment;"
+        out[#out + 1] = " filename*=UTF-8''" .. percent(attachment.name)
+        out[#out + 1] = "Content-Transfer-Encoding: base64"
+        out[#out + 1] = ""
+        out[#out + 1] = encoded(data)
+    end
+    out[#out + 1] = "--" .. boundary .. "--\r\n"
+    local result = table.concat(out, "\r\n")
+    assert(#result <= cfg.maxMailBytes, "MIME 超出 maxMailBytes；请调低预算或调高限制")
+    return result
+end
+
+local function mailFailed(r, why)
+    r.attempts = (r.attempts or 0) + 1
+    local delay = math.min(cfg.retryMax, cfg.retryInitial * 2 ^ math.min(r.attempts - 1, 20))
+    r.retryAt, r.lastMailError = wall() + delay, short(why)
+    save(r)
+    note("e", string.format("邮件失败 %s 第 %d 封；%d 秒后重试：%s", r.id, r.nextPart, delay, short(why)))
+end
+
+pumpMail = function()
+    if not running or mailTask then return end
+    stopTimer(mailTimer); mailTimer = nil
+    local selected, nextDue
+    for _, r in pairs(reports) do
+        if r.status == "pending" then
+            if (r.retryAt or 0) <= wall() then
+                if not selected or r.started < selected.started then selected = r end
+            else
+                nextDue = math.min(nextDue or math.huge, r.retryAt)
+            end
+        end
+    end
+    if not selected then
+        if nextDue then mailTimer = hs.timer.doAfter(math.max(0.1, nextDue - wall()), safe(pumpMail)) end
+        return
+    end
+    local r = selected
+    local ok, data = pcall(function()
+        assert(cfg.from ~= "" and #cfg.to > 0, "未设置 from / to")
+        if not r.parts then plan(r); save(r) end
+        local data = message(r)
+        local path = cfg.stateRoot .. "/outgoing.eml"
+        local f = assert(io.open(path, "wb"))
+        local written, why = f:write(data)
+        local closed, closeError = f:close()
+        assert(written, why); assert(closed, closeError)
+        return path
+    end)
+    if not ok then
+        mailFailed(r, data)
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail)); return
+    end
+    local task
+    -- hs.task:setInput 会在主线程同步写 pipe；SMTP 不读正文时可能卡住解锁事件。
+    -- 通过文件重定向喂给 msmtp，shell 参数只走位置参数，exec 后仍是同一 PID。
+    task = hs.task.new("/bin/sh", safe(function(code, _, stderr)
+        if mailTask ~= task then return end
+        mailTask = nil; stopTimer(mailTimeout); mailTimeout = nil
+        os.remove(data)
+        if code == 0 then
+            r.nextPart, r.attempts, r.retryAt, r.lastMailError = r.nextPart + 1, 0, 0, nil
+            if r.nextPart > #r.parts then r.status = "sent" end
+            save(r)
+            note("i", string.format("邮件已提交 SMTP %s 第 %d/%d 封", r.id, r.nextPart - 1, #r.parts))
+            if r.status == "sent" then reports[r.id] = nil end
+        else mailFailed(r, "msmtp exit=" .. code .. " " .. short(stderr)) end
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
+    end), { "-c", 'exec "$1" --account="$2" --timeout=30 --read-recipients --from="$3" < "$4"',
+        "lockscreen-camera-mail", cfg.msmtp, cfg.account, cfg.from, data })
+    mailTask = task
+    if not task or not task:start() then
+        mailTask = nil; mailFailed(r, "msmtp 无法启动：" .. cfg.msmtp)
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail)); return
+    end
+    mailTimeout = hs.timer.doAfter(cfg.mailTimeout, safe(function()
+        if mailTask ~= task then return end
+        mailTask = nil; mailTimeout = nil; killTask(task)
+        os.remove(data)
+        mailFailed(r, "msmtp 发送超时；提交结果不确定，保留相同 Message-ID 重试")
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
+    end))
+end
+
+finish = function(reason)
+    local s = session
+    if not s then return end
+    session = nil -- 先失效，杀进程后的任何旧回调都不能继续拍摄。
+    stopTimer(s.timer); stopTimer(s.timeout); stopTimer(s.limitTimer)
+    local task = camera; camera = nil
+    killTask(task)
+    local r = s.report
+    -- 取消/超时只纳入已经完整写出的 JPEG，未完成的临时文件删除。
+    acceptPending(r)
+    r.cameraPID = nil
+    r.status, r.reason, r.endedText = "pending", reason, stamp()
+    reports[r.id] = r
+    save(r) -- 即使退出时不能联网，也已成为可恢复的待发送报告。
+    note("i", string.format("结束 %s %s：%d 张；%s", r.kind, r.id, #r.photos, reason))
+    if running then
+        stopTimer(mailTimer)
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
+    end
+end
+
+capture = function(s)
+    if not running or session ~= s or camera then return end
+    if (s.report.kind == "locked" and (not locked or not awake))
+        or (s.report.kind == "after_unlock" and (locked or not awake)) then
+        finish("拍摄前系统状态已改变"); return
+    end
+    -- 即使定时器提前触发/系统时钟回拨，也不得提前拍或补拍漏掉的 tick。
+    local remaining = s.due - monotonic()
+    if remaining > 0 then
+        s.timer = hs.timer.doAfter(math.max(0.01, remaining), safe(function() capture(s) end)); return
+    end
+    s.timer = nil
+    local r = s.report
+    local name = stamp() .. "-" .. (r.kind == "locked" and "锁屏" or "解锁后") .. ".jpg"
+    local final = r.dir .. "/" .. name
+    -- 秒级命名发生碰撞（如系统时间回拨）时跳过，既不覆盖也不额外添加编号。
+    if hs.fs.symlinkAttributes(final) then
+        note("i", "跳过已存在的照片：" .. final)
+        s.due = monotonic() + s.interval
+        s.timer = hs.timer.doAfter(s.interval, safe(function() capture(s) end))
+        return
+    end
+    r.pending = { path = r.dir .. "/.pending-" .. r.id .. ".jpg", final = final,
+        started = wall(), monotonicStart = monotonic() }
+    save(r) -- 先记录目标文件，崩溃恢复也能找回已写完但未回调的照片。
+    local args = { "-q", "-w", tostring(cfg.warmup) }
+    if cfg.device then args[#args + 1] = "-d"; args[#args + 1] = cfg.device end
+    args[#args + 1] = r.pending.path
+    local task
+    task = hs.task.new(cfg.imagesnap, safe(function(code, _, stderr)
+        if session ~= s or camera ~= task then return end
+        camera = nil; stopTimer(s.timeout); s.timeout = nil; r.cameraPID = nil
+        if code ~= 0 then finish("ImageSnap exit=" .. code .. " " .. short(stderr)); return end
+        if not acceptPending(r) then finish("ImageSnap 未输出完整 JPEG"); return end
+        save(r)
+        local photo = r.photos[#r.photos]
+        note("i", string.format("照片 %s；单调时钟完成时间 %.3f", photo.path, photo.monotonicEnd))
+        if r.kind == "after_unlock" and #r.photos >= cfg.afterUnlockCount then
+            finish("解锁后已拍满 " .. cfg.afterUnlockCount .. " 张"); return
+        end
+        -- 从上一张完成起计算，确保真实拍照间隔至少为 5 / 30 秒。
+        s.due = monotonic() + s.interval
+        s.timer = hs.timer.doAfter(s.interval, safe(function() capture(s) end))
+    end), args)
+    camera = task
+    if not task or not task:start() then
+        camera = nil; finish("ImageSnap 无法启动：" .. cfg.imagesnap); return
+    end
+    r.cameraPID = task:pid(); save(r)
+    s.timeout = hs.timer.doAfter(cfg.cameraTimeout, safe(function()
+        if session == s and camera == task then finish("ImageSnap 拍照超时（" .. cfg.cameraTimeout .. " 秒）") end
+    end))
+end
+
+local function begin(kind, delay, directory, threadRoot)
+    if session then return end
+    local id, text = uuid(), stamp()
+    local r = { id = id, kind = kind, status = "active", photos = {},
+        started = wall(), startedText = text,
+        dir = directory or cfg.photoRoot .. "/" .. text,
+        threadRoot = threadRoot or string.format("<%s.1@lockscreen-camera.local>", id) }
+    if kind == "locked" then followupDir, followupThreadRoot = r.dir, r.threadRoot end
+    local s = { report = r, interval = kind == "locked" and cfg.lockedInterval or cfg.afterUnlockInterval,
+        due = monotonic() + delay }
+    session = s
+    save(r)
+    mkdir(r.dir)
+    note("i", "开始 " .. kind .. " " .. id)
+    if kind == "locked" and cfg.maxLockedSeconds > 0 then
+        s.limitTimer = hs.timer.doAfter(cfg.maxLockedSeconds, safe(function()
+            if session == s then finish("达到锁屏拍摄时长上限") end
+        end))
+    end
+    if delay == 0 then capture(s)
+    else s.timer = hs.timer.doAfter(delay, safe(function() capture(s) end)) end
+end
+
+local function event(eventType)
+    if not running then return end
+    local w = hs.caffeinate.watcher
+    note("i", "系统事件 " .. tostring(eventType))
+    if eventType == w.screensDidLock then
+        if locked then return end
+        locked, followupArmed, wakeHandled = true, false, false
+        followupDir, followupThreadRoot = nil, nil
+        finish("解锁后再次锁屏，取消剩余拍摄")
+        -- 锁屏本身不启动摄像头，等待屏幕唤醒事件。
+    elseif eventType == w.screensDidWake then
+        awake = true
+        local properties = hs.caffeinate.sessionProperties()
+        if properties and properties.CGSSessionScreenIsLocked ~= nil then
+            locked = properties.CGSSessionScreenIsLocked == true
+        end
+        if locked and not wakeHandled then
+            wakeHandled, followupArmed = true, true
+            begin("locked", 0)
+        end
+    elseif eventType == w.screensDidUnlock then
+        -- 系统 screensDidUnlock 通知就是确认；重复通知不重置后续定时器。
+        if not locked then return end
+        locked = false
+        local followup = followupArmed
+        local directory = followupDir
+        local threadRoot = followupThreadRoot
+        followupArmed = false
+        followupDir, followupThreadRoot = nil, nil
+        finish("系统确认解锁成功")
+        if followup and awake then begin("after_unlock", cfg.afterUnlockInterval, directory, threadRoot) end
+    elseif eventType == w.screensDidSleep or eventType == w.systemWillSleep
+        or eventType == w.sessionDidResignActive then
+        awake, wakeHandled, followupArmed = false, false, false
+        followupDir, followupThreadRoot = nil, nil
+        finish("显示器黑屏、系统休眠或用户会话离开，结束本轮")
+    elseif eventType == w.systemWillPowerOff then
+        M.stop("系统即将关机")
+    end
+end
+
+local function recover()
+    for file in hs.fs.dir(cfg.stateRoot .. "/reports") do
+        if file:match("%.json$") then
+            local ok, err = pcall(function()
+                local r = readJSON(cfg.stateRoot .. "/reports/" .. file)
+                if r.status == "active" then
+                    -- 仅清理命令行含本轮唯一临时文件名的旧进程，避免 PID 复用误杀。
+                    if r.cameraPID and r.pending then
+                        local pid = assert(tonumber(r.cameraPID))
+                        local cmd = hs.execute("/bin/ps -p " .. string.format("%d", pid) .. " -o command=")
+                        if cmd:find(r.pending.path, 1, true) then
+                            hs.execute("/bin/kill -KILL " .. string.format("%d", pid))
+                        end
+                    end
+                    acceptPending(r)
+                    r.cameraPID, r.status = nil, "pending"
+                    r.reason, r.endedText = "恢复未正常结束的拍摄；不自动恢复摄像头，仅发送已有照片", stamp()
+                    save(r)
+                end
+                if r.status == "pending" then reports[r.id] = r end
+            end)
+            if not ok then note("e", "恢复失败，保留原记录 " .. file .. "：" .. short(err)) end
+        end
+    end
+end
+
+function M.start(options)
+    if running then return M end
+    cfg = {}
+    for k, v in pairs(defaults) do cfg[k] = v end
+    for k, v in pairs(options or {}) do assert(defaults[k] ~= nil or k == "device" or k == "deviceName", "未知配置：" .. k); cfg[k] = v end
+    cfg.deviceName = cfg.deviceName or hs.host.localizedName() or "Mac"
+    if type(cfg.to) == "string" then cfg.to = { cfg.to } end
+    if #cfg.to == 0 and cfg.from ~= "" then cfg.to = { cfg.from } end
+    for _, name in ipairs({ "lockedInterval", "afterUnlockInterval", "afterUnlockCount", "cameraTimeout", "mailTimeout", "retryInitial", "retryMax" }) do
+        assert(type(cfg[name]) == "number" and cfg[name] > 0, name .. " 必须 > 0")
+    end
+    assert(cfg.afterUnlockCount % 1 == 0, "afterUnlockCount 必须为整数")
+    assert(cfg.maxMailBytes >= 128 * 1024, "maxMailBytes 至少为 128 KiB")
+    assert(cfg.warmup >= 0 and cfg.maxLockedSeconds >= 0)
+    assert(not cfg.from:find("[\r\n]"), "无效发件地址")
+    assert(type(cfg.fromName) == "string" and not cfg.fromName:find("[\r\n]"), "无效发件人显示名")
+    for _, address in ipairs(cfg.to) do assert(not address:find("[\r\n]"), "无效收件地址") end
+    mkdir(cfg.stateRoot .. "/reports")
+    -- 文件锁随进程退出释放，阻止同一队列的多个模块实例并行拍照/发信。
+    stateLock = assert(io.open(cfg.stateRoot .. "/instance.lock", "a"))
+    if not hs.fs.lock(stateLock, "w") then stateLock:close(); stateLock = nil; error("lockscreen_camera 已有实例运行") end
+    reports = {}
+    recover()
+    running, awake, wakeHandled, followupArmed = true, false, false, false
+    followupDir, followupThreadRoot = nil, nil
+    local properties = hs.caffeinate.sessionProperties()
+    locked = properties and properties.CGSSessionScreenIsLocked == true or false
+    watcher = hs.caffeinate.watcher.new(safe(event)):start()
+    previousShutdown = hs.shutdownCallback
+    shutdownHook = function()
+        local ok, err = pcall(M.stop, "Hammerspoon 重载或退出")
+        if not ok then note("e", short(err)) end
+        if previousShutdown then previousShutdown() end
+    end
+    hs.shutdownCallback = shutdownHook
+    mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
+    note("i", "模块启动；等待锁屏显示器唤醒；邮件队列已恢复")
+    return M
+end
+
+function M.stop(reason)
+    if not running then return end
+    running = false
+    followupArmed, followupDir, followupThreadRoot = false, nil, nil
+    if watcher then watcher:stop(); watcher = nil end
+    stopTimer(mailTimer); stopTimer(mailTimeout); mailTimer, mailTimeout = nil, nil
+    local task = mailTask; mailTask = nil; killTask(task)
+    os.remove(cfg.stateRoot .. "/outgoing.eml")
+    local ok, err = pcall(finish, reason or "模块停止")
+    if hs.shutdownCallback == shutdownHook then hs.shutdownCallback = previousShutdown end
+    if stateLock then hs.fs.unlock(stateLock); stateLock:close(); stateLock = nil end
+    note("i", "模块已停止；未发送邮件留待下次启动恢复")
+    if not ok then error(err) end
+end
+
+function M.status()
+    local pending = 0
+    for _, r in pairs(reports) do if r.status == "pending" then pending = pending + 1 end end
+    return { running = running, locked = locked, awake = awake,
+        phase = session and session.report.kind or "waiting", photos = session and #session.report.photos or 0,
+        cameraRunning = camera ~= nil, mailRunning = mailTask ~= nil, pendingReports = pending }
+end
+
+return M
