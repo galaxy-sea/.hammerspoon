@@ -25,6 +25,7 @@ local defaults = {
 }
 local cfg, watcher, wifiWatcher, previousShutdown, shutdownHook
 local ignoredSSIDSet, currentSSID, wifiIgnored = {}, nil, false
+local wifiInterface, wifiReadError, wifiLocationStatus, wifiLocationEnabled, wifiDiagnostic
 local running, locked, awake, wakeHandled, followupArmed = false, false, false, false, false
 local followupDir -- 同一轮锁屏与解锁后拍摄共用目录，报告和邮件仍各自独立。
 local followupThreadRoot -- 两个阶段及分封邮件均引用本轮第一封邮件。
@@ -62,6 +63,55 @@ local function save(r)
     local closed, closeError = f:close()
     assert(ok, err); assert(closed, closeError)
     assert(os.rename(path .. ".tmp", path))
+end
+
+-- 同目录内的报告全部发送成功且不再拍摄时，才清理本轮照片和空目录。
+-- 先持久化 sent，再删除文件；清理中断后可在重载时继续，绝不重新发信。
+local function cleanupSentPhotos()
+    local groups = {}
+    for _, r in pairs(reports) do
+        local group = groups[r.dir]
+        if not group then group = {}; groups[r.dir] = group end
+        group[#group + 1] = r
+    end
+    for directory, group in pairs(groups) do
+        local ready = not (session and session.report.dir == directory)
+            and not (followupArmed and followupDir == directory)
+        for _, r in ipairs(group) do
+            if r.status ~= "sent" then ready = false end
+        end
+        if ready then
+            local ok, err = pcall(function()
+                -- 不递归删除，只处理报告中明确记录的照片及其日期目录。
+                assert(directory ~= cfg.photoRoot and directory:match("/%d%d%d%d%-%d%d%-%d%d_%d%d%-%d%d%-%d%d$"),
+                    "拒绝清理非日期目录：" .. tostring(directory))
+                local mode = hs.fs.symlinkAttributes(directory, "mode")
+                assert(mode == nil or mode == "directory", "照片目录不是普通目录：" .. directory)
+                for _, r in ipairs(group) do
+                    for _, photo in ipairs(r.photos) do
+                        assert(photo.path:match("^(.*)/[^/]+$") == directory,
+                            "照片不在本轮目录：" .. photo.path)
+                        if mode and hs.fs.symlinkAttributes(photo.path) then
+                            local removed, why = os.remove(photo.path)
+                            assert(removed, why)
+                        end
+                    end
+                end
+                -- remove 仅能删除空目录；未记录的文件不会被递归移除。
+                if mode then
+                    local removed, why = os.remove(directory)
+                    assert(removed, why)
+                end
+                for _, r in ipairs(group) do
+                    r.photosCleaned, r.photosCleanedText = true, stamp()
+                    save(r)
+                    reports[r.id] = nil
+                end
+            end)
+            if ok then note("i", "已发送照片及日期目录已清理：" .. directory)
+            else note("e", "清理已发送照片失败，保留记录待下次处理：" .. short(err)) end
+        end
+    end
 end
 
 local function readJSON(path)
@@ -199,10 +249,8 @@ local function message(r)
     local boundary = "lockscreen_" .. r.id .. "_" .. part
     local kind = r.kind == "locked" and (r.unlockedText and "锁屏及解锁时照片" or "锁屏期间照片") or "解锁后照片"
     local subject = cfg.fromName .. " - 锁屏异常唤醒"
-    local body = string.format("设备：%s\n阶段：%s\n开始：%s\n结束：%s\n原因：%s\n照片总数：%d\n本机目录：%s\n邮件：%d/%d\n",
-        cfg.deviceName, kind, r.startedText, r.endedText, short(r.reason), #r.photos, r.dir, part, #r.parts)
-        .. "超限时分封保留全部照片。*.jpg.partNNNNNN 为原图字节块，请收齐同名块后按块号拼接（cat 原文件名.jpg.part* > restored.jpg）。\n"
-        .. "原图和发送记录均保存在本机；SMTP 超时重试可能产生相同 Message-ID 的重复邮件。\n"
+    local body = string.format("设备：%s\n阶段：%s\n开始：%s\n结束：%s\n原因：%s\n照片总数：%d\n本机目录：%s\n",
+        cfg.deviceName, kind, r.startedText, r.endedText, short(r.reason), #r.photos, r.dir)
     local sender = cfg.from
     if cfg.fromName ~= "" then sender = header(cfg.fromName) .. " <" .. cfg.from .. ">" end
     local messageID = string.format("<%s.%d@lockscreen-camera.local>", r.id, part)
@@ -252,6 +300,7 @@ end
 
 pumpMail = function()
     if not running or checkWiFi() or mailTask then return end
+    cleanupSentPhotos()
     stopTimer(mailTimer); mailTimer = nil
     local selected, nextDue
     for _, r in pairs(reports) do
@@ -295,7 +344,7 @@ pumpMail = function()
             if r.nextPart > #r.parts then r.status = "sent" end
             save(r)
             note("i", string.format("邮件已提交 SMTP %s 第 %d/%d 封", r.id, r.nextPart - 1, #r.parts))
-            if r.status == "sent" then reports[r.id] = nil end
+            if r.status == "sent" then cleanupSentPhotos() end
         else mailFailed(r, "msmtp exit=" .. code .. " " .. short(stderr)) end
         mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
     end), { "-c", 'exec "$1" --account="$2" --timeout=30 --read-recipients --from="$3" < "$4"',
@@ -322,7 +371,7 @@ finish = function(reason, ignoreReport)
     stopCapture(s)
     local r = s.report
     r.status, r.reason, r.endedText = ignoreReport and "ignored" or "pending", reason, stamp()
-    if not ignoreReport then reports[r.id] = r end
+    reports[r.id] = r
     save(r) -- 即使退出时不能联网，也已成为可恢复的待发送报告。
     note("i", string.format("结束 %s %s：%d 张；%s", r.kind, r.id, #r.photos, reason))
     if running and not ignoreReport then
@@ -336,15 +385,51 @@ finish = function(reason, ignoreReport)
     end
 end
 
-checkWiFi = function()
+-- 读取当前连接，绝不使用附近扫描结果或已保存网络代替当前 SSID。
+local function readWiFi()
     local ok, ssid = pcall(hs.wifi.currentNetwork)
-    if not ok or type(ssid) ~= "string" then ssid = nil end
+    if ok and type(ssid) == "string" and ssid ~= "" then return ssid end
+    local errors = {}
+    if not ok then errors[#errors + 1] = short(ssid) end
+    local listed, interfaces = pcall(hs.wifi.interfaces)
+    if listed and type(interfaces) == "table" then
+        -- 默认接口可能不可用；尝试每个实际无线接口，不假定一定是 en0。
+        for _, interface in ipairs(interfaces) do
+            local read, name = pcall(hs.wifi.currentNetwork, interface)
+            if read and type(name) == "string" and name ~= "" then return name, interface end
+            if not read then errors[#errors + 1] = interface .. ": " .. short(name) end
+        end
+        if #interfaces == 0 then errors[#errors + 1] = "未发现无线网卡" end
+    else
+        errors[#errors + 1] = "无线网卡枚举失败：" .. short(interfaces)
+    end
+    return nil, nil, #errors > 0 and table.concat(errors, "；") or nil
+end
+
+checkWiFi = function()
+    local ssid, interface, readError = readWiFi()
+    local diagnostic = ssid
+    wifiLocationStatus, wifiLocationEnabled = nil, nil
+    if not ssid then
+        -- 只查询权限，不自动请求定位，避免模块启动时弹出授权窗口。
+        local authorized, status = pcall(function() return hs.location.authorizationStatus() end)
+        local enabled, services = pcall(function() return hs.location.servicesEnabled() end)
+        wifiLocationStatus = authorized and status or "读取失败"
+        if enabled then wifiLocationEnabled = services end
+        diagnostic = "无法读取 Wi-Fi 名称（可能未连接或受系统权限限制）；定位授权："
+            .. tostring(wifiLocationStatus) .. "；定位服务："
+            .. (enabled and (services and "已开启" or "已关闭") or "读取失败")
+        if readError then diagnostic = diagnostic .. "；接口错误：" .. readError end
+        diagnostic = diagnostic .. "；无法匹配 Wi-Fi 跳过名单，继续正常监控"
+    end
     local ignored = ssid ~= nil and ignoredSSIDSet[ssid] == true
     local wasIgnored = wifiIgnored
-    local changed = ssid ~= currentSSID or ignored ~= wifiIgnored
+    local changed = diagnostic ~= wifiDiagnostic or ignored ~= wifiIgnored
     currentSSID, wifiIgnored = ssid, ignored
+    wifiInterface, wifiReadError, wifiDiagnostic = interface, readError, diagnostic
     if changed then
-        note("i", "当前 Wi-Fi：" .. (ssid or "未知或未连接") .. (ignored and "；匹配跳过名单" or "；正常监控"))
+        note(ssid and "i" or "w", "当前 Wi-Fi：" .. diagnostic
+            .. (ssid and (ignored and "；匹配跳过名单" or "；正常监控") or ""))
     end
     if ignored then
         followupArmed, followupDir, followupThreadRoot = false, nil, nil
@@ -434,6 +519,7 @@ begin = function(kind, delay, directory, threadRoot, unlockDue)
     local s = { report = r, interval = kind == "locked" and cfg.lockedInterval or cfg.afterUnlockInterval,
         due = monotonic() + delay, unlockSnapshot = unlockDue ~= nil, followupDue = unlockDue }
     session = s
+    reports[r.id] = r
     save(r)
     mkdir(r.dir)
     note("i", "开始 " .. kind .. " " .. id)
@@ -500,6 +586,7 @@ local function event(eventType)
     elseif eventType == w.systemWillPowerOff then
         M.stop("系统即将关机")
     end
+    cleanupSentPhotos()
 end
 
 local function recover()
@@ -521,7 +608,7 @@ local function recover()
                     r.reason, r.endedText = "恢复未正常结束的拍摄；不自动恢复摄像头，仅发送已有照片", stamp()
                     save(r)
                 end
-                if r.status == "pending" then reports[r.id] = r end
+                if not r.photosCleaned then reports[r.id] = r end
             end)
             if not ok then note("e", "恢复失败，保留原记录 " .. file .. "：" .. short(err)) end
         end
@@ -560,7 +647,9 @@ function M.start(options)
     running, awake, wakeHandled, followupArmed = true, false, false, false
     followupDir, followupThreadRoot = nil, nil
     currentSSID, wifiIgnored = nil, false
+    wifiInterface, wifiReadError, wifiLocationStatus, wifiLocationEnabled, wifiDiagnostic = nil, nil, nil, nil, nil
     checkWiFi()
+    cleanupSentPhotos()
     local properties = hs.caffeinate.sessionProperties()
     locked = properties and properties.CGSSessionScreenIsLocked == true or false
     watcher = hs.caffeinate.watcher.new(safe(event)):start()
@@ -576,7 +665,7 @@ function M.start(options)
     end
     hs.shutdownCallback = shutdownHook
     mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
-    note("i", "模块启动；当前 Wi-Fi：" .. (currentSSID or "未知或未连接")
+    note("i", "模块启动；当前 Wi-Fi：" .. (currentSSID or "名称不可用，详见前面的 Wi-Fi 权限诊断")
         .. (wifiIgnored and "；跳过拍摄并暂停邮件" or "；等待锁屏显示器唤醒；邮件队列已恢复"))
     return M
 end
@@ -590,7 +679,10 @@ function M.stop(reason)
     stopTimer(mailTimer); stopTimer(mailTimeout); mailTimer, mailTimeout = nil, nil
     local task = mailTask; mailTask = nil; killTask(task)
     os.remove(cfg.stateRoot .. "/outgoing.eml")
-    local ok, err = pcall(finish, reason or "模块停止")
+    local ok, err = pcall(function()
+        finish(reason or "模块停止")
+        cleanupSentPhotos()
+    end)
     if hs.shutdownCallback == shutdownHook then hs.shutdownCallback = previousShutdown end
     if stateLock then hs.fs.unlock(stateLock); stateLock:close(); stateLock = nil end
     note("i", "模块已停止；未发送邮件留待下次启动恢复")
@@ -602,6 +694,9 @@ function M.status()
     for _, r in pairs(reports) do if r.status == "pending" then pending = pending + 1 end end
     return { running = running, locked = locked, awake = awake,
         ssid = currentSSID, wifiIgnored = wifiIgnored,
+        wifiInterface = wifiInterface, wifiReadError = wifiReadError,
+        wifiLocationStatus = wifiLocationStatus, wifiLocationEnabled = wifiLocationEnabled,
+        wifiDiagnostic = wifiDiagnostic,
         phase = session and (session.unlockSnapshot and "unlock" or session.report.kind) or "waiting",
         photos = session and #session.report.photos or 0,
         cameraRunning = camera ~= nil, mailRunning = mailTask ~= nil, pendingReports = pending }
