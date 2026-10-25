@@ -8,6 +8,7 @@ local defaults = {
     from = "", -- 在 init.lua 设置；不在这里保存 SMTP 密码。
     fromName = "", -- 收件人看到的发件人显示名；不用于 SMTP 登录或信封地址。
     to = {},
+    ignoredSSIDs = {}, -- 连接到这些 Wi-Fi 时，不拍摄、不发信。
     photoRoot = home .. "/Downloads/异常解锁",
     stateRoot = hs.configdir .. "/.lockscreen_camera",
     lockedInterval = 5,
@@ -22,14 +23,15 @@ local defaults = {
     retryMax = 3600,
     device = nil, -- nil：系统默认摄像头；否则传给 imagesnap -d。
 }
-local cfg, watcher, previousShutdown, shutdownHook
+local cfg, watcher, wifiWatcher, previousShutdown, shutdownHook
+local ignoredSSIDSet, currentSSID, wifiIgnored = {}, nil, false
 local running, locked, awake, wakeHandled, followupArmed = false, false, false, false, false
 local followupDir -- 同一轮锁屏与解锁后拍摄共用目录，报告和邮件仍各自独立。
 local followupThreadRoot -- 两个阶段及分封邮件均引用本轮第一封邮件。
 local session, camera, mailTask, mailTimer, mailTimeout, stateLock
 local reports = {}
 local log = hs.logger.new("lockscreen_camera", "info")
-local finish, capture, pumpMail
+local finish, capture, pumpMail, begin, checkWiFi
 
 local function monotonic() return hs.timer.absoluteTime() / 1e9 end
 local function wall() return hs.timer.secondsSinceEpoch() end
@@ -111,6 +113,16 @@ local function acceptPending(r)
     return valid
 end
 
+local function stopCapture(s)
+    stopTimer(s.timer); stopTimer(s.timeout); stopTimer(s.limitTimer)
+    s.timer, s.timeout, s.limitTimer = nil, nil, nil
+    local task = camera; camera = nil
+    killTask(task)
+    -- 只纳入已经完整写出的 JPEG，未完成的临时文件删除。
+    acceptPending(s.report)
+    s.report.cameraPID = nil
+end
+
 -- MIME 预算预留正文/头部及每个附件开销；超大单图按原始字节拆分，绝不丢弃。
 local function plan(r)
     local budget = math.floor((cfg.maxMailBytes - 65536) / 1.38)
@@ -185,7 +197,7 @@ end
 local function message(r)
     local part = r.nextPart
     local boundary = "lockscreen_" .. r.id .. "_" .. part
-    local kind = r.kind == "locked" and "锁屏期间照片" or "解锁后照片"
+    local kind = r.kind == "locked" and (r.unlockedText and "锁屏及解锁时照片" or "锁屏期间照片") or "解锁后照片"
     local subject = cfg.fromName .. " - 锁屏异常唤醒"
     local body = string.format("设备：%s\n阶段：%s\n开始：%s\n结束：%s\n原因：%s\n照片总数：%d\n本机目录：%s\n邮件：%d/%d\n",
         cfg.deviceName, kind, r.startedText, r.endedText, short(r.reason), #r.photos, r.dir, part, #r.parts)
@@ -239,7 +251,7 @@ local function mailFailed(r, why)
 end
 
 pumpMail = function()
-    if not running or mailTask then return end
+    if not running or checkWiFi() or mailTask then return end
     stopTimer(mailTimer); mailTimer = nil
     local selected, nextDue
     for _, r in pairs(reports) do
@@ -302,31 +314,58 @@ pumpMail = function()
     end))
 end
 
-finish = function(reason)
+finish = function(reason, ignoreReport)
     local s = session
     if not s then return end
+    if not ignoreReport and checkWiFi() then return end
     session = nil -- 先失效，杀进程后的任何旧回调都不能继续拍摄。
-    stopTimer(s.timer); stopTimer(s.timeout); stopTimer(s.limitTimer)
-    local task = camera; camera = nil
-    killTask(task)
+    stopCapture(s)
     local r = s.report
-    -- 取消/超时只纳入已经完整写出的 JPEG，未完成的临时文件删除。
-    acceptPending(r)
-    r.cameraPID = nil
-    r.status, r.reason, r.endedText = "pending", reason, stamp()
-    reports[r.id] = r
+    r.status, r.reason, r.endedText = ignoreReport and "ignored" or "pending", reason, stamp()
+    if not ignoreReport then reports[r.id] = r end
     save(r) -- 即使退出时不能联网，也已成为可恢复的待发送报告。
     note("i", string.format("结束 %s %s：%d 张；%s", r.kind, r.id, #r.photos, reason))
-    if running then
+    if running and not ignoreReport then
         stopTimer(mailTimer)
         mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
     end
+    -- 补拍成功、失败或超时都会先发送第一阶段，再独立进行后续拍摄。
+    -- 黑屏、重新锁屏或停止模块时，不启动后续任务。
+    if not ignoreReport and s.followupDue and running and awake and not locked then
+        begin("after_unlock", math.max(0, s.followupDue - monotonic()), r.dir, r.threadRoot)
+    end
+end
+
+checkWiFi = function()
+    local ok, ssid = pcall(hs.wifi.currentNetwork)
+    if not ok or type(ssid) ~= "string" then ssid = nil end
+    local ignored = ssid ~= nil and ignoredSSIDSet[ssid] == true
+    local wasIgnored = wifiIgnored
+    local changed = ssid ~= currentSSID or ignored ~= wifiIgnored
+    currentSSID, wifiIgnored = ssid, ignored
+    if changed then
+        note("i", "当前 Wi-Fi：" .. (ssid or "未知或未连接") .. (ignored and "；匹配跳过名单" or "；正常监控"))
+    end
+    if ignored then
+        followupArmed, followupDir, followupThreadRoot = false, nil, nil
+        finish("连接到跳过名单中的 Wi-Fi：" .. ssid .. "；保留本机照片，不发送本阶段通知", true)
+        stopTimer(mailTimer); stopTimer(mailTimeout); mailTimer, mailTimeout = nil, nil
+        local task = mailTask; mailTask = nil; killTask(task)
+        if task then os.remove(cfg.stateRoot .. "/outgoing.eml") end
+    elseif wasIgnored and running then
+        -- 无论由 Wi-Fi 通知还是系统事件先发现离网，都恢复已排队的邮件。
+        wakeHandled = false
+        stopTimer(mailTimer)
+        mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
+    end
+    return ignored
 end
 
 capture = function(s)
     if not running or session ~= s or camera then return end
-    if (s.report.kind == "locked" and (not locked or not awake))
-        or (s.report.kind == "after_unlock" and (locked or not awake)) then
+    if checkWiFi() then return end
+    local needsLocked = s.report.kind == "locked" and not s.unlockSnapshot
+    if not awake or (needsLocked and not locked) or (not needsLocked and locked) then
         finish("拍摄前系统状态已改变"); return
     end
     -- 即使定时器提前触发/系统时钟回拨，也不得提前拍或补拍漏掉的 tick。
@@ -336,11 +375,13 @@ capture = function(s)
     end
     s.timer = nil
     local r = s.report
-    local name = stamp() .. "-" .. (r.kind == "locked" and "锁屏" or "解锁后") .. ".jpg"
+    local photoType = s.unlockSnapshot and "解锁" or (r.kind == "locked" and "锁屏" or "解锁后")
+    local name = stamp() .. "-" .. photoType .. ".jpg"
     local final = r.dir .. "/" .. name
     -- 秒级命名发生碰撞（如系统时间回拨）时跳过，既不覆盖也不额外添加编号。
     if hs.fs.symlinkAttributes(final) then
         note("i", "跳过已存在的照片：" .. final)
+        if s.unlockSnapshot then finish("系统确认解锁成功，解锁补拍文件已存在，跳过本次补拍"); return end
         s.due = monotonic() + s.interval
         s.timer = hs.timer.doAfter(s.interval, safe(function() capture(s) end))
         return
@@ -354,12 +395,16 @@ capture = function(s)
     local task
     task = hs.task.new(cfg.imagesnap, safe(function(code, _, stderr)
         if session ~= s or camera ~= task then return end
+        if checkWiFi() then return end
         camera = nil; stopTimer(s.timeout); s.timeout = nil; r.cameraPID = nil
         if code ~= 0 then finish("ImageSnap exit=" .. code .. " " .. short(stderr)); return end
         if not acceptPending(r) then finish("ImageSnap 未输出完整 JPEG"); return end
         save(r)
         local photo = r.photos[#r.photos]
         note("i", string.format("照片 %s；单调时钟完成时间 %.3f", photo.path, photo.monotonicEnd))
+        if s.unlockSnapshot then
+            finish("系统确认解锁成功，已补拍解锁照片"); return
+        end
         if r.kind == "after_unlock" and #r.photos >= cfg.afterUnlockCount then
             finish("解锁后已拍满 " .. cfg.afterUnlockCount .. " 张"); return
         end
@@ -377,21 +422,22 @@ capture = function(s)
     end))
 end
 
-local function begin(kind, delay, directory, threadRoot)
-    if session then return end
+begin = function(kind, delay, directory, threadRoot, unlockDue)
+    if checkWiFi() or session then return end
     local id, text = uuid(), stamp()
     local r = { id = id, kind = kind, status = "active", photos = {},
         started = wall(), startedText = text,
         dir = directory or cfg.photoRoot .. "/" .. text,
-        threadRoot = threadRoot or string.format("<%s.1@lockscreen-camera.local>", id) }
-    if kind == "locked" then followupDir, followupThreadRoot = r.dir, r.threadRoot end
+        threadRoot = threadRoot or string.format("<%s.1@lockscreen-camera.local>", id),
+        unlockedText = unlockDue and stamp() or nil }
+    if kind == "locked" and not unlockDue then followupDir, followupThreadRoot = r.dir, r.threadRoot end
     local s = { report = r, interval = kind == "locked" and cfg.lockedInterval or cfg.afterUnlockInterval,
-        due = monotonic() + delay }
+        due = monotonic() + delay, unlockSnapshot = unlockDue ~= nil, followupDue = unlockDue }
     session = s
     save(r)
     mkdir(r.dir)
     note("i", "开始 " .. kind .. " " .. id)
-    if kind == "locked" and cfg.maxLockedSeconds > 0 then
+    if kind == "locked" and not s.unlockSnapshot and cfg.maxLockedSeconds > 0 then
         s.limitTimer = hs.timer.doAfter(cfg.maxLockedSeconds, safe(function()
             if session == s then finish("达到锁屏拍摄时长上限") end
         end))
@@ -402,16 +448,20 @@ end
 
 local function event(eventType)
     if not running then return end
+    checkWiFi()
     local w = hs.caffeinate.watcher
     note("i", "系统事件 " .. tostring(eventType))
     if eventType == w.screensDidLock then
         if locked then return end
-        locked, followupArmed, wakeHandled = true, false, false
+        locked, followupArmed, wakeHandled = true, true, false
         followupDir, followupThreadRoot = nil, nil
         finish("解锁后再次锁屏，取消剩余拍摄")
         -- 锁屏本身不启动摄像头，等待屏幕唤醒事件。
     elseif eventType == w.screensDidWake then
         awake = true
+        -- 快速解锁时，会话查询可能已显示未锁定，但解锁通知尚未送达。
+        -- 保留已观察到的锁屏记录，确保随后仍能启动解锁后拍摄。
+        if locked then followupArmed = true end
         local properties = hs.caffeinate.sessionProperties()
         if properties and properties.CGSSessionScreenIsLocked ~= nil then
             locked = properties.CGSSessionScreenIsLocked == true
@@ -422,15 +472,26 @@ local function event(eventType)
         end
     elseif eventType == w.screensDidUnlock then
         -- 系统 screensDidUnlock 通知就是确认；重复通知不重置后续定时器。
-        if not locked then return end
-        locked = false
-        local followup = followupArmed
+        if not locked and not followupArmed then return end
+        locked, awake = false, true
+        local followupDue = monotonic() + cfg.afterUnlockInterval
         local directory = followupDir
         local threadRoot = followupThreadRoot
         followupArmed = false
         followupDir, followupThreadRoot = nil, nil
-        finish("系统确认解锁成功")
-        if followup and awake then begin("after_unlock", cfg.afterUnlockInterval, directory, threadRoot) end
+        if session and session.report.kind == "locked" then
+            -- 停止旧的循环任务，保留报告；补拍的一张归入锁屏邮件后再结束。
+            local s = session
+            s.unlockSnapshot, s.followupDue = true, followupDue
+            s.report.unlockedText = stamp()
+            stopCapture(s)
+            s.due = monotonic()
+            capture(s)
+        else
+            -- 快速解锁尚无锁屏报告，或原阶段已经失败：仍补拍并通知。
+            finish("系统确认解锁成功")
+            begin("locked", 0, directory, threadRoot, followupDue)
+        end
     elseif eventType == w.screensDidSleep or eventType == w.systemWillSleep
         or eventType == w.sessionDidResignActive then
         awake, wakeHandled, followupArmed = false, false, false
@@ -473,6 +534,12 @@ function M.start(options)
     for k, v in pairs(defaults) do cfg[k] = v end
     for k, v in pairs(options or {}) do assert(defaults[k] ~= nil or k == "device" or k == "deviceName", "未知配置：" .. k); cfg[k] = v end
     cfg.deviceName = cfg.deviceName or hs.host.localizedName() or "Mac"
+    assert(type(cfg.ignoredSSIDs) == "table", "ignoredSSIDs 必须为 Wi-Fi 名称列表")
+    ignoredSSIDSet = {}
+    for _, ssid in ipairs(cfg.ignoredSSIDs) do
+        assert(type(ssid) == "string" and ssid ~= "", "ignoredSSIDs 中的 Wi-Fi 名称不能为空")
+        ignoredSSIDSet[ssid] = true
+    end
     if type(cfg.to) == "string" then cfg.to = { cfg.to } end
     if #cfg.to == 0 and cfg.from ~= "" then cfg.to = { cfg.from } end
     for _, name in ipairs({ "lockedInterval", "afterUnlockInterval", "afterUnlockCount", "cameraTimeout", "mailTimeout", "retryInitial", "retryMax" }) do
@@ -492,9 +559,15 @@ function M.start(options)
     recover()
     running, awake, wakeHandled, followupArmed = true, false, false, false
     followupDir, followupThreadRoot = nil, nil
+    currentSSID, wifiIgnored = nil, false
+    checkWiFi()
     local properties = hs.caffeinate.sessionProperties()
     locked = properties and properties.CGSSessionScreenIsLocked == true or false
     watcher = hs.caffeinate.watcher.new(safe(event)):start()
+    wifiWatcher = hs.wifi.watcher.new(safe(function()
+        -- 只恢复旧邮件，已取消的拍摄等待新一轮系统事件。
+        checkWiFi()
+    end)):start()
     previousShutdown = hs.shutdownCallback
     shutdownHook = function()
         local ok, err = pcall(M.stop, "Hammerspoon 重载或退出")
@@ -503,7 +576,8 @@ function M.start(options)
     end
     hs.shutdownCallback = shutdownHook
     mailTimer = hs.timer.doAfter(0.1, safe(pumpMail))
-    note("i", "模块启动；等待锁屏显示器唤醒；邮件队列已恢复")
+    note("i", "模块启动；当前 Wi-Fi：" .. (currentSSID or "未知或未连接")
+        .. (wifiIgnored and "；跳过拍摄并暂停邮件" or "；等待锁屏显示器唤醒；邮件队列已恢复"))
     return M
 end
 
@@ -512,6 +586,7 @@ function M.stop(reason)
     running = false
     followupArmed, followupDir, followupThreadRoot = false, nil, nil
     if watcher then watcher:stop(); watcher = nil end
+    if wifiWatcher then wifiWatcher:stop(); wifiWatcher = nil end
     stopTimer(mailTimer); stopTimer(mailTimeout); mailTimer, mailTimeout = nil, nil
     local task = mailTask; mailTask = nil; killTask(task)
     os.remove(cfg.stateRoot .. "/outgoing.eml")
@@ -526,7 +601,9 @@ function M.status()
     local pending = 0
     for _, r in pairs(reports) do if r.status == "pending" then pending = pending + 1 end end
     return { running = running, locked = locked, awake = awake,
-        phase = session and session.report.kind or "waiting", photos = session and #session.report.photos or 0,
+        ssid = currentSSID, wifiIgnored = wifiIgnored,
+        phase = session and (session.unlockSnapshot and "unlock" or session.report.kind) or "waiting",
+        photos = session and #session.report.photos or 0,
         cameraRunning = camera ~= nil, mailRunning = mailTask ~= nil, pendingReports = pending }
 end
 

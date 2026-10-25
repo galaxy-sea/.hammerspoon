@@ -16,9 +16,10 @@ require("modules.lockscreen_camera").start({
     from = "2468080401@qq.com",
     fromName = "MacBook Pro 21 M1 Pro",
     to = { "469753862@qq.com" },
+    ignoredSSIDs = { "galaxy", "galaxy-5G" }, -- 连接到这些 Wi-Fi 时不拍摄、不发信
     lockedInterval = 5,        -- 锁屏唤醒后拍摄间隔（秒）
-    afterUnlockCount = 10,     -- 解锁后拍摄数量（张）
-    afterUnlockInterval = 30,  -- 解锁后首张等待时间及后续拍摄间隔（秒）
+    afterUnlockCount = 10,     -- 后续阶段拍摄总数，不包含归入第一封邮件的解锁补拍（张）
+    afterUnlockInterval = 30,  -- 后续阶段首张等待时间（从解锁起算）及拍摄间隔（秒）
 })
 
 -- 监听应用的关闭窗口快捷键，不拦截原始按键。
