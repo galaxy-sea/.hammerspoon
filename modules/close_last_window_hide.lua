@@ -28,10 +28,30 @@ local function hasRealWindows(app)
     return #windows > 0
 end
 
-function M.start()
+-- shortcut 由 init.lua 传入，须与目标应用实际的关闭窗口快捷键一致。
+function M.start(shortcut)
     -- 防止重复启动
     if watcher then
         return
+    end
+
+    assert(shortcut, "close_last_window_hide.start 需要传入快捷键配置")
+    if shortcut.bind == false then
+        return
+    end
+
+    local keyCode = assert(
+        hs.keycodes.map[shortcut.key:lower()],
+        "未知的关闭窗口按键：" .. shortcut.key
+    )
+    local modifiers = {}
+    for _, modifier in ipairs(shortcut.mods) do
+        assert(
+            modifier == "cmd" or modifier == "ctrl"
+                or modifier == "alt" or modifier == "shift",
+            "不支持的修饰键：" .. modifier
+        )
+        modifiers[modifier] = true
     end
 
     watcher = hs.eventtap.new(
@@ -40,28 +60,23 @@ function M.start()
         },
         function(event)
             local flags = event:getFlags()
-            local keyCode = event:getKeyCode()
 
-            -- 只监听纯 Command + W
-            --
-            -- 不处理：
-            -- Command + Shift + W
-            -- Command + Option + W
-            -- Command + Control + W
-            if keyCode == hs.keycodes.map.w
-                and flags.cmd
-                and not flags.shift
-                and not flags.alt
-                and not flags.ctrl
-            then
-                -- 记录按下 Command + W 时的前台应用
+            -- 严格匹配配置的修饰键，额外按下其他修饰键时不触发。
+            for _, modifier in ipairs({ "cmd", "ctrl", "alt", "shift" }) do
+                if (flags[modifier] or false) ~= (modifiers[modifier] or false) then
+                    return false
+                end
+            end
+
+            if event:getKeyCode() == keyCode then
+                -- 记录按下快捷键时的前台应用
                 local app = hs.application.frontmostApplication()
 
                 if app then
                     -- 使用 PID 标识这一次运行的应用实例
                     local pid = app:pid()
 
-                    -- 给应用一点时间处理原始 Command + W
+                    -- 给应用一点时间处理原始关闭窗口快捷键
                     hs.timer.doAfter(0.15, function()
                         -- 通过 PID 重新取得刚才的应用
                         local targetApp =
@@ -81,7 +96,7 @@ function M.start()
             end
 
             -- false：
-            -- 不拦截原始 Command + W，
+            -- 不拦截原始快捷键，
             -- 继续让当前应用正常处理关闭窗口操作
             return false
         end

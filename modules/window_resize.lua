@@ -1,7 +1,7 @@
 ------------------------------------------------------------
 -- window_resize.lua
 --
--- Ctrl + Cmd + Shift + 5
+-- 快捷键由 init.lua 传入 start({ mods = {...}, key = "..." })
 --
 -- 1. 点击预置尺寸
 -- 2. 输入：
@@ -14,9 +14,6 @@
 ------------------------------------------------------------
 
 local M = {}
-
-local MODS = { "ctrl", "cmd", "shift" }
-local KEY = "5"
 
 ------------------------------------------------------------
 -- px -> points
@@ -247,7 +244,7 @@ end
 -- 初始化
 ------------------------------------------------------------
 
-function M.start()
+function M.start(hotkey)
 
     --------------------------------------------------------
     -- Chooser
@@ -340,14 +337,16 @@ function M.start()
     -- 快捷键
     --------------------------------------------------------
 
-    hs.hotkey.bind(
-        MODS,
-        KEY,
-        showResizeChooser
-    )
+    if hotkey and hotkey.bind ~= false then
+        hs.hotkey.bind(
+            hotkey.mods,
+            hotkey.key,
+            showResizeChooser
+        )
+    end
 
     print(
-        "[WindowResize] started: Ctrl+Cmd+Shift+5"
+        "[WindowResize] started"
     )
 end
 
