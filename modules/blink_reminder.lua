@@ -3,8 +3,8 @@
 -- 三个关闭按钮各自在显示器随机位置出现、每次随机换色。
 -- Hammerspoon 全局检测鼠标位置：无需点击，进入按钮区域立即开始连续悬停10秒计时。
 -- 不自动关闭、不淡出、不创建菜单栏倒计时。
--- 使用：require("modules.blink_reminder").start({ mods = {...}, key = "..." })
--- bind = false 或不传快捷键时仅启动定时提醒，也可调用 .show() 手动显示。
+-- 使用：require("modules.blink_reminder").start({ hotkey = { mods = {...}, key = "..." } })
+-- hotkey.bind = false 或不传快捷键时仅启动定时提醒，也可调用 .show() 手动显示。
 
 local M = {}
 
@@ -457,7 +457,8 @@ local function handleMessage(message)
     end
 end
 
-function M.start(hotkey)
+function M.start(options)
+    local hotkey = options and options.hotkey
     -- 重复 .start() 不会注册多个定时器/热键。
     if app.running then return M end
     cleanupPreviousVersion()

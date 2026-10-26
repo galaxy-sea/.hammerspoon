@@ -28,14 +28,15 @@ local function hasRealWindows(app)
     return #windows > 0
 end
 
--- shortcut 由 init.lua 传入，须与目标应用实际的关闭窗口快捷键一致。
-function M.start(shortcut)
+-- hotkey 对象由 init.lua 传入，须与目标应用实际的关闭窗口快捷键一致。
+function M.start(options)
+    local shortcut = options and options.hotkey
     -- 防止重复启动
     if watcher then
         return
     end
 
-    assert(shortcut, "close_last_window_hide.start 需要传入快捷键配置")
+    assert(shortcut, "close_last_window_hide.start 需要传入 hotkey 配置")
     if shortcut.bind == false then
         return
     end

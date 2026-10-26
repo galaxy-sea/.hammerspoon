@@ -1,7 +1,7 @@
 ------------------------------------------------------------
 -- window_resize.lua
 --
--- 快捷键由 init.lua 传入 start({ mods = {...}, key = "..." })
+-- 快捷键由 init.lua 传入 start({ hotkey = { mods = {...}, key = "..." } })
 --
 -- 1. 点击预置尺寸
 -- 2. 输入：
@@ -244,7 +244,8 @@ end
 -- 初始化
 ------------------------------------------------------------
 
-function M.start(hotkey)
+function M.start(options)
+    local hotkey = options and options.hotkey
 
     --------------------------------------------------------
     -- Chooser
